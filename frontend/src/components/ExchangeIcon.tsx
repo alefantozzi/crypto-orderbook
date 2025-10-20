@@ -36,6 +36,17 @@ export function SimpleIconsCoinbase(props: SVGProps<SVGSVGElement>) {
   );
 }
 
+export function SimpleIconsHyperliquid(props: SVGProps<SVGSVGElement>) {
+  return (
+    <svg xmlns="http://www.w3.org/2000/svg" width="1em" height="1em" viewBox="0 0 24 24" {...props}>
+      {/* TODO: Replace with actual Hyperliquid logo SVG */}
+      {/* Placeholder icon - using 'H' letter in a circle */}
+      <circle cx="12" cy="12" r="10" fill="currentColor" opacity="0.2" />
+      <text x="12" y="16" textAnchor="middle" fontSize="14" fontWeight="bold" fill="currentColor">H</text>
+    </svg>
+  );
+}
+
 type ExchangeIconProps = SVGProps<SVGSVGElement> & {
   exchange: string;
 };
@@ -63,6 +74,9 @@ export function ExchangeIcon({ exchange, className, ...props }: ExchangeIconProp
   }
   if (exchangeLower.includes('coinbase')) {
     return <SimpleIconsCoinbase className={className} {...props} />;
+  }
+  if (exchangeLower.includes('hyperliquid')) {
+    return <SimpleIconsHyperliquid className={className} {...props} />;
   }
 
   // Fallback: return first letter as text in a similar size
