@@ -1,52 +1,51 @@
 package hyperliquid
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
 	"log"
+	"net/http"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
 
-	"github.com/gorilla/websocket"
 	"orderbook/internal/exchange"
+
+	"github.com/gorilla/websocket"
 )
 
 const (
-	// TODO: Replace with actual Hyperliquid WebSocket URL for perpetual futures
-	futuresWsURL = "wss://api.hyperliquid.xyz/ws" // Placeholder WebSocket URL
-	// TODO: Replace with actual Hyperliquid REST URL for snapshot
-	futuresRestURL = "https://api.hyperliquid.xyz/info" // Placeholder REST URL
+	hyperliquidWSURL = "wss://api.hyperliquid.xyz/ws"
+	infoRESTEndpoint = "https://api.hyperliquid.xyz/info"
+	pingInterval     = 50 * time.Second
 )
 
-// FuturesExchange implements the Exchange interface for Hyperliquid Perpetual Futures
 type FuturesExchange struct {
-	symbol        string
-	wsConn        *websocket.Conn
-	updateChan    chan *exchange.DepthUpdate
-	done          chan struct{}
-	ctx           context.Context
-	cancel        context.CancelFunc
-	health        atomic.Value // stores exchange.HealthStatus
-	snapshotMutex sync.Mutex
-	snapshot      *exchange.Snapshot
-	snapshotReady chan struct{}
-	hasSnapshot   bool
+	symbol     string
+	wsConn     *websocket.Conn
+	updateChan chan *exchange.DepthUpdate
+	done       chan struct{}
+	ctx        context.Context
+	cancel     context.CancelFunc
+
+	health      atomic.Value
+	snapshotMu  sync.Mutex
+	snapshot    *exchange.Snapshot
+	snapshotSet bool
 }
 
-// NewFuturesExchange creates a new Hyperliquid Futures exchange instance
 func NewFuturesExchange(config Config) *FuturesExchange {
 	ctx, cancel := context.WithCancel(context.Background())
 
 	ex := &FuturesExchange{
-		symbol:        config.Symbol,
-		updateChan:    make(chan *exchange.DepthUpdate, 1000),
-		done:          make(chan struct{}),
-		ctx:           ctx,
-		cancel:        cancel,
-		snapshotReady: make(chan struct{}),
-		hasSnapshot:   false,
+		symbol:     config.Symbol,
+		updateChan: make(chan *exchange.DepthUpdate, 1000),
+		done:       make(chan struct{}),
+		ctx:        ctx,
+		cancel:     cancel,
 	}
 
 	ex.health.Store(exchange.HealthStatus{
@@ -59,66 +58,49 @@ func NewFuturesExchange(config Config) *FuturesExchange {
 	return ex
 }
 
-// GetName returns the exchange name
-func (e *FuturesExchange) GetName() exchange.ExchangeName {
-	return exchange.Hyperliquid
-}
+func (e *FuturesExchange) GetName() exchange.ExchangeName { return exchange.Hyperliquidf }
+func (e *FuturesExchange) GetSymbol() string              { return e.symbol }
 
-// GetSymbol returns the trading symbol
-func (e *FuturesExchange) GetSymbol() string {
-	return e.symbol
-}
-
-// Connect establishes WebSocket connection to Hyperliquid Futures
 func (e *FuturesExchange) Connect(ctx context.Context) error {
-	dialer := websocket.Dialer{
-		HandshakeTimeout: 10 * time.Second,
-	}
+	dialer := websocket.Dialer{HandshakeTimeout: 10 * time.Second}
 
-	conn, _, err := dialer.DialContext(ctx, futuresWsURL, nil)
+	conn, _, err := dialer.DialContext(ctx, hyperliquidWSURL, nil)
 	if err != nil {
 		e.incrementErrorCount()
-		return fmt.Errorf("websocket connection failed: %w", err)
+		return fmt.Errorf("hyperliquid websocket dial failed: %w", err)
 	}
 
 	e.wsConn = conn
 	e.updateConnectionStatus(true)
-	log.Printf("[%s] WebSocket connected successfully", e.GetName())
+	log.Printf("[%s] WebSocket connected to %s", e.GetName(), hyperliquidWSURL)
 
-	// TODO: Replace with actual Hyperliquid subscription message format
-	// Subscribe to orderbook depth and trades for the symbol
-	subMsg := SubscriptionMessage{
-		Method: "subscribe",
-		Params: map[string]interface{}{
-			"channel": fmt.Sprintf("orderbook.%s", e.symbol),
-		},
+	// helper to write subscribe
+	subscribe := func(sub interface{}) error {
+		msg := map[string]interface{}{"method": "subscribe", "subscription": sub}
+		return conn.WriteJSON(msg)
 	}
 
-	if err := conn.WriteJSON(subMsg); err != nil {
+	coin := mapToHLCoin(e.symbol)
+
+	// subscribe l2Book (orderbook)
+	if err := subscribe(map[string]interface{}{"type": "l2Book", "coin": coin}); err != nil {
 		e.incrementErrorCount()
-		return fmt.Errorf("failed to subscribe to orderbook: %w", err)
+		conn.Close()
+		return fmt.Errorf("failed subscribe l2Book: %w", err)
 	}
 
-	log.Printf("[%s] Subscribed to orderbook for %s", e.GetName(), e.symbol)
+	// subscribe trades (optional)
+	if err := subscribe(map[string]interface{}{"type": "trades", "coin": coin}); err != nil {
+		// do not fail entire connector for trades subscription; log only
+		log.Printf("[%s] warning: failed subscribe trades: %v", e.GetName(), err)
+	}
 
-	// TODO: Subscribe to trades if needed
-	// tradesSubMsg := SubscriptionMessage{
-	// 	Method: "subscribe",
-	// 	Params: map[string]interface{}{
-	// 		"channel": fmt.Sprintf("trades.%s", e.symbol),
-	// 	},
-	// }
-	// if err := conn.WriteJSON(tradesSubMsg); err != nil {
-	// 	log.Printf("[%s] Warning: failed to subscribe to trades: %v", e.GetName(), err)
-	// }
-
-	go e.readMessages()
 	go e.pingLoop()
+	go e.readMessages()
 
 	return nil
 }
 
-// Close closes the WebSocket connection
 func (e *FuturesExchange) Close() error {
 	if e.cancel != nil {
 		e.cancel()
@@ -131,11 +113,7 @@ func (e *FuturesExchange) Close() error {
 			close(e.done)
 		}
 
-		err := e.wsConn.WriteMessage(websocket.CloseMessage,
-			websocket.FormatCloseMessage(websocket.CloseNormalClosure, ""))
-		if err != nil {
-			log.Printf("[%s] Error sending close message: %v", e.GetName(), err)
-		}
+		_ = e.wsConn.WriteMessage(websocket.CloseMessage, websocket.FormatCloseMessage(websocket.CloseNormalClosure, ""))
 
 		select {
 		case <-time.After(time.Second):
@@ -147,67 +125,91 @@ func (e *FuturesExchange) Close() error {
 	return nil
 }
 
-// GetSnapshot waits for and returns the initial orderbook snapshot
-// TODO: Consider fetching via REST API if Hyperliquid provides a REST endpoint
 func (e *FuturesExchange) GetSnapshot(ctx context.Context) (*exchange.Snapshot, error) {
-	log.Printf("[%s] Waiting for initial snapshot from WebSocket...", e.GetName())
+	log.Printf("[%s] Fetching L2 snapshot via REST for %s", e.GetName(), e.symbol)
 
-	select {
-	case <-e.snapshotReady:
-		e.snapshotMutex.Lock()
-		snapshot := e.snapshot
-		e.snapshotMutex.Unlock()
-		return snapshot, nil
-	case <-ctx.Done():
-		return nil, fmt.Errorf("context cancelled while waiting for snapshot")
-	case <-time.After(30 * time.Second):
-		return nil, fmt.Errorf("timeout waiting for snapshot")
+	reqBody := map[string]interface{}{"type": "l2Book", "coin": mapToHLCoin(e.symbol)}
+	b, err := json.Marshal(reqBody)
+	if err != nil {
+		return nil, err
 	}
+
+	req, err := http.NewRequestWithContext(ctx, "POST", infoRESTEndpoint, bytes.NewReader(b))
+	if err != nil {
+		return nil, err
+	}
+	req.Header.Set("Content-Type", "application/json")
+
+	client := &http.Client{Timeout: 10 * time.Second}
+	resp, err := client.Do(req)
+	if err != nil {
+		e.incrementErrorCount()
+		return nil, err
+	}
+	defer resp.Body.Close()
+
+	var res struct {
+		Coin   string      `json:"coin"`
+		Time   int64       `json:"time"`
+		Levels [][]WsLevel `json:"levels"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&res); err != nil {
+		e.incrementErrorCount()
+		return nil, fmt.Errorf("decode snapshot failed: %w", err)
+	}
+
+	bids := make([]exchange.PriceLevel, 0, len(res.Levels[0]))
+	for _, lvl := range res.Levels[0] {
+		bids = append(bids, exchange.PriceLevel{Price: lvl.Px, Quantity: lvl.Sz})
+	}
+	asks := make([]exchange.PriceLevel, 0, len(res.Levels[1]))
+	for _, lvl := range res.Levels[1] {
+		asks = append(asks, exchange.PriceLevel{Price: lvl.Px, Quantity: lvl.Sz})
+	}
+
+	snapshot := &exchange.Snapshot{
+		Exchange:     e.GetName(),
+		Symbol:       res.Coin,
+		LastUpdateID: 0,
+		Bids:         bids,
+		Asks:         asks,
+		Timestamp:    time.UnixMilli(res.Time),
+	}
+
+	e.snapshotMu.Lock()
+	e.snapshot = snapshot
+	e.snapshotSet = true
+	e.snapshotMu.Unlock()
+
+	return snapshot, nil
 }
 
-// Updates returns a channel that receives depth updates
-func (e *FuturesExchange) Updates() <-chan *exchange.DepthUpdate {
-	return e.updateChan
-}
-
-// IsConnected checks if the WebSocket connection is active
-func (e *FuturesExchange) IsConnected() bool {
-	return e.wsConn != nil
-}
-
-// Health returns connection health information
+func (e *FuturesExchange) Updates() <-chan *exchange.DepthUpdate { return e.updateChan }
+func (e *FuturesExchange) IsConnected() bool                     { return e.wsConn != nil }
 func (e *FuturesExchange) Health() exchange.HealthStatus {
-	if status, ok := e.health.Load().(exchange.HealthStatus); ok {
-		return status
+	if s, ok := e.health.Load().(exchange.HealthStatus); ok {
+		return s
 	}
 	return exchange.HealthStatus{}
 }
 
-// pingLoop sends periodic pings to keep the connection alive
 func (e *FuturesExchange) pingLoop() {
-	ticker := time.NewTicker(30 * time.Second)
-	defer ticker.Stop()
-
+	t := time.NewTicker(pingInterval)
+	defer t.Stop()
 	for {
 		select {
 		case <-e.ctx.Done():
 			return
 		case <-e.done:
 			return
-		case <-ticker.C:
-			// TODO: Verify if Hyperliquid requires explicit ping messages
-			// Send ping message if needed
+		case <-t.C:
 			if e.wsConn != nil {
-				if err := e.wsConn.WriteMessage(websocket.PingMessage, []byte{}); err != nil {
-					log.Printf("[%s] Failed to send ping: %v", e.GetName(), err)
-					e.incrementErrorCount()
-				}
+				_ = e.wsConn.WriteJSON(map[string]string{"method": "ping"})
 			}
 		}
 	}
 }
 
-// readMessages continuously reads WebSocket messages
 func (e *FuturesExchange) readMessages() {
 	defer close(e.updateChan)
 	defer e.updateConnectionStatus(false)
@@ -215,182 +217,91 @@ func (e *FuturesExchange) readMessages() {
 	for {
 		select {
 		case <-e.ctx.Done():
-			log.Printf("[%s] Context cancelled, stopping message reading", e.GetName())
+			log.Printf("[%s] context cancelled, stopping readMessages", e.GetName())
 			return
 		case <-e.done:
 			return
 		default:
-			messageType, message, err := e.wsConn.ReadMessage()
+			_, msgBytes, err := e.wsConn.ReadMessage()
 			if err != nil {
 				e.incrementErrorCount()
 				log.Printf("[%s] WebSocket read error: %v", e.GetName(), err)
 				return
 			}
 
-			if err := e.handleMessage(messageType, message); err != nil {
-				log.Printf("[%s] Error handling message: %v", e.GetName(), err)
+			var env struct {
+				Channel string          `json:"channel"`
+				Data    json.RawMessage `json:"data"`
+			}
+			if err := json.Unmarshal(msgBytes, &env); err != nil {
+				log.Printf("[%s] failed to unmarshal envelope: %v", e.GetName(), err)
+				continue
+			}
+
+			switch env.Channel {
+			case "subscriptionResponse":
+				// ack; ignore
+				continue
+			case "l2Book":
+				var book WsBook
+				if err := json.Unmarshal(env.Data, &book); err != nil {
+					log.Printf("[%s] failed parse l2Book: %v", e.GetName(), err)
+					continue
+				}
+				e.incrementMessageCount()
+				e.updateLastPing()
+
+				bids := make([]exchange.PriceLevel, 0, len(book.Levels[0]))
+				for _, lvl := range book.Levels[0] {
+					bids = append(bids, exchange.PriceLevel{Price: lvl.Px, Quantity: lvl.Sz})
+				}
+				asks := make([]exchange.PriceLevel, 0, len(book.Levels[1]))
+				for _, lvl := range book.Levels[1] {
+					asks = append(asks, exchange.PriceLevel{Price: lvl.Px, Quantity: lvl.Sz})
+				}
+
+				depth := &exchange.DepthUpdate{
+					Exchange:      e.GetName(),
+					Symbol:        book.Coin,
+					EventTime:     time.UnixMilli(book.Time),
+					FirstUpdateID: 0,
+					FinalUpdateID: 0,
+					PrevUpdateID:  0,
+					Bids:          bids,
+					Asks:          asks,
+				}
+
+				select {
+				case e.updateChan <- depth:
+				case <-e.ctx.Done():
+					return
+				case <-e.done:
+					return
+				default:
+					log.Printf("[%s] Warning: update channel full, skipping update", e.GetName())
+				}
+
+			case "trades":
+				var trades []WsTrade
+				if err := json.Unmarshal(env.Data, &trades); err != nil {
+					log.Printf("[%s] failed parse trades: %v", e.GetName(), err)
+					continue
+				}
+				e.incrementMessageCount()
+				e.updateLastPing()
+				// Minimal behavior: log trades. If you want trades forwarded to UI, see notes below.
+				for _, t := range trades {
+					log.Printf("[%s] trade %s px=%s sz=%s side=%s time=%d", e.GetName(), t.Coin, t.Px, t.Sz, t.Side, t.Time)
+				}
+			default:
+				// ignore other channels for now
+				continue
 			}
 		}
 	}
 }
 
-// handleMessage processes incoming WebSocket messages
-func (e *FuturesExchange) handleMessage(messageType int, message []byte) error {
-	if messageType != websocket.TextMessage {
-		// TODO: Handle binary messages if Hyperliquid uses them
-		return nil
-	}
-
-	// TODO: Handle ping/pong if Hyperliquid sends text-based pings
-	msgStr := string(message)
-	if msgStr == "ping" || msgStr == "PING" {
-		if err := e.wsConn.WriteMessage(websocket.TextMessage, []byte("pong")); err != nil {
-			log.Printf("[%s] Failed to send pong: %v", e.GetName(), err)
-		}
-		return nil
-	}
-
-	// Parse JSON message
-	// TODO: Replace with actual Hyperliquid message structure parsing
-	var msg WSMessage
-	if err := json.Unmarshal(message, &msg); err != nil {
-		// Might be a non-JSON message, log and ignore
-		log.Printf("[%s] Failed to parse JSON message: %v", e.GetName(), err)
-		return nil
-	}
-
-	// TODO: Implement proper message type detection based on Hyperliquid's protocol
-	// This is a placeholder structure that needs to be replaced with actual parsing
-	
-	// Attempt to parse as depth data
-	var depthData DepthData
-	if dataBytes, err := json.Marshal(msg.Data); err == nil {
-		if err := json.Unmarshal(dataBytes, &depthData); err == nil {
-			// Check if this is a snapshot or update
-			// TODO: Determine how Hyperliquid distinguishes between snapshot and update
-			if depthData.Action == "snapshot" || (!e.hasSnapshot && len(depthData.Bids) > 0) {
-				e.handleSnapshot(&depthData)
-			} else if depthData.Action == "update" || e.hasSnapshot {
-				e.handleUpdate(&depthData)
-			}
-		}
-	}
-
-	e.incrementMessageCount()
-	e.updateLastPing()
-
-	return nil
-}
-
-// handleSnapshot processes the initial full depth snapshot
-func (e *FuturesExchange) handleSnapshot(data *DepthData) {
-	e.snapshotMutex.Lock()
-	defer e.snapshotMutex.Unlock()
-
-	if e.hasSnapshot {
-		// Already have snapshot, treat as update
-		return
-	}
-
-	snapshot := e.convertSnapshot(data)
-	e.snapshot = snapshot
-	e.hasSnapshot = true
-
-	log.Printf("[%s] Received initial snapshot with updateId=%d, bids=%d, asks=%d",
-		e.GetName(), snapshot.LastUpdateID, len(snapshot.Bids), len(snapshot.Asks))
-
-	// Signal that snapshot is ready
-	select {
-	case <-e.snapshotReady:
-	default:
-		close(e.snapshotReady)
-	}
-}
-
-// handleUpdate processes incremental depth updates
-func (e *FuturesExchange) handleUpdate(data *DepthData) {
-	canonicalUpdate := e.convertDepthUpdate(data)
-
-	select {
-	case e.updateChan <- canonicalUpdate:
-	case <-e.ctx.Done():
-		return
-	case <-e.done:
-		return
-	default:
-		log.Printf("[%s] Warning: update channel full, skipping update", e.GetName())
-	}
-}
-
-// convertSnapshot converts Hyperliquid snapshot to canonical format
-// TODO: Adjust based on actual Hyperliquid response structure
-func (e *FuturesExchange) convertSnapshot(data *DepthData) *exchange.Snapshot {
-	bids := make([]exchange.PriceLevel, 0, len(data.Bids))
-	for _, bid := range data.Bids {
-		if len(bid) >= 2 {
-			bids = append(bids, exchange.PriceLevel{
-				Price:    bid[0],
-				Quantity: bid[1],
-			})
-		}
-	}
-
-	asks := make([]exchange.PriceLevel, 0, len(data.Asks))
-	for _, ask := range data.Asks {
-		if len(ask) >= 2 {
-			asks = append(asks, exchange.PriceLevel{
-				Price:    ask[0],
-				Quantity: ask[1],
-			})
-		}
-	}
-
-	return &exchange.Snapshot{
-		Exchange:     e.GetName(),
-		Symbol:       e.symbol,
-		LastUpdateID: data.UpdateID,
-		Bids:         bids,
-		Asks:         asks,
-		Timestamp:    time.Now(),
-	}
-}
-
-// convertDepthUpdate converts Hyperliquid depth update to canonical format
-// TODO: Adjust based on actual Hyperliquid response structure
-func (e *FuturesExchange) convertDepthUpdate(data *DepthData) *exchange.DepthUpdate {
-	bids := make([]exchange.PriceLevel, 0, len(data.Bids))
-	for _, bid := range data.Bids {
-		if len(bid) >= 2 {
-			bids = append(bids, exchange.PriceLevel{
-				Price:    bid[0],
-				Quantity: bid[1],
-			})
-		}
-	}
-
-	asks := make([]exchange.PriceLevel, 0, len(data.Asks))
-	for _, ask := range data.Asks {
-		if len(ask) >= 2 {
-			asks = append(asks, exchange.PriceLevel{
-				Price:    ask[0],
-				Quantity: ask[1],
-			})
-		}
-	}
-
-	return &exchange.DepthUpdate{
-		Exchange:      e.GetName(),
-		Symbol:        e.symbol,
-		EventTime:     time.Now(),
-		FirstUpdateID: data.UpdateID,
-		FinalUpdateID: data.UpdateID,
-		PrevUpdateID:  data.UpdateID - 1,
-		Bids:          bids,
-		Asks:          asks,
-	}
-}
-
-// updateConnectionStatus updates the connection status in health
+// health helpers
 func (e *FuturesExchange) updateConnectionStatus(connected bool) {
 	status := e.Health()
 	status.Connected = connected
@@ -401,23 +312,31 @@ func (e *FuturesExchange) updateConnectionStatus(connected bool) {
 	e.health.Store(status)
 }
 
-// incrementMessageCount increments the message count in health
 func (e *FuturesExchange) incrementMessageCount() {
 	status := e.Health()
 	status.MessageCount++
 	e.health.Store(status)
 }
 
-// incrementErrorCount increments the error count in health
 func (e *FuturesExchange) incrementErrorCount() {
 	status := e.Health()
 	status.ErrorCount++
 	e.health.Store(status)
 }
 
-// updateLastPing updates the last ping time in health
 func (e *FuturesExchange) updateLastPing() {
 	status := e.Health()
 	status.LastPing = time.Now()
 	e.health.Store(status)
+}
+
+// mapToHLCoin converts symbols like BTCUSDT -> BTC
+func mapToHLCoin(sym string) string {
+	s := strings.ToUpper(sym)
+	for _, suf := range []string{"USDT", "USD", "USDC"} {
+		if strings.HasSuffix(s, suf) {
+			return strings.TrimSuffix(s, suf)
+		}
+	}
+	return s
 }
